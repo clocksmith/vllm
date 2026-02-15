@@ -1082,6 +1082,9 @@ class FusedMoEConfig:
     # Defaults to in_dtype if not specified.
     router_logits_dtype: torch.dtype | None = None
 
+    # Optional KV role from disaggregated prefill/decode deployments.
+    # Expected values: "kv_producer", "kv_consumer", "kv_both".
+    kv_role: str | None = None
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
     has_bias: bool = False
     is_act_and_mul: bool = True

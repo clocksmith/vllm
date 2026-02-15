@@ -162,6 +162,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_USE_SONIC_MOE: bool = False
+    VLLM_SONIC_MOE_PD_BACKEND_MODE: Literal[
+        "off", "prefill_sonic_decode_triton"
+    ] = "off"
     VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput", "latency", "masked_gemm"] = (
         "latency"
     )
@@ -1190,6 +1193,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Allow use of Sonic MoE kernels for Hopper GPUs (H100/H200).
     "VLLM_USE_SONIC_MOE": lambda: bool(int(os.getenv("VLLM_USE_SONIC_MOE", "0"))),
+    # In PD mode, force backend choice by KV role:
+    # - kv_producer (prefill): Sonic
+    # - kv_consumer (decode): Triton
+    # This only applies to CUDA unquantized MoE backend selection.
+    "VLLM_SONIC_MOE_PD_BACKEND_MODE": env_with_choices(
+        "VLLM_SONIC_MOE_PD_BACKEND_MODE",
+        "off",
+        ["off", "prefill_sonic_decode_triton"],
+    ),
     # If set to 1, use the FlashInfer
     # MXFP8 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": lambda: bool(

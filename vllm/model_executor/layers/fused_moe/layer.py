@@ -556,6 +556,11 @@ class FusedMoE(CustomOp):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=moe_in_dtype,
             router_logits_dtype=router_logits_dtype,
+            kv_role=(
+                vllm_config.kv_transfer_config.kv_role
+                if vllm_config.kv_transfer_config is not None
+                else None
+            ),
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,

@@ -68,13 +68,33 @@ def select_unquantized_moe_backend(
     rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
 
     backend = UnquantizedMoeBackend.TRITON
+    sonic_pd_mode = envs.VLLM_SONIC_MOE_PD_BACKEND_MODE
+    force_sonic_for_prefill = (
+        sonic_pd_mode == "prefill_sonic_decode_triton"
+        and moe_config.kv_role == "kv_producer"
+    )
+    force_triton_for_decode = (
+        sonic_pd_mode == "prefill_sonic_decode_triton"
+        and moe_config.kv_role == "kv_consumer"
+    )
+    if (
+        sonic_pd_mode == "prefill_sonic_decode_triton"
+        and moe_config.kv_role is None
+    ):
+        logger.info_once(
+            "VLLM_SONIC_MOE_PD_BACKEND_MODE=prefill_sonic_decode_triton "
+            "is set, but kv_role is unavailable; using default backend "
+            "selection.",
+            scope="local",
+        )
+
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
         if moe_config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
     sonic_enabled = False
-    if envs.VLLM_USE_SONIC_MOE:
+    if envs.VLLM_USE_SONIC_MOE or force_sonic_for_prefill:
         from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
 
         sonic_enabled, reason = SonicMoeExperts.is_supported_config(
@@ -86,6 +106,8 @@ def select_unquantized_moe_backend(
         )
         if not sonic_enabled and reason is not None:
             logger.debug_once("Sonic MoE disabled because %s.", reason)
+    if force_triton_for_decode:
+        sonic_enabled = False
 
     # Check if FlashInfer TRTLLM BF16 MoE is supported
     trtllm_supported, _ = is_supported_config_trtllm_bf16(
@@ -109,7 +131,19 @@ def select_unquantized_moe_backend(
         else:
             backend = UnquantizedMoeBackend.TRITON
     if current_platform.is_cuda():
-        if flashinfer_trtllm_moe_enabled:
+        if force_triton_for_decode:
+            backend = UnquantizedMoeBackend.TRITON
+        elif force_sonic_for_prefill:
+            if sonic_enabled:
+                backend = UnquantizedMoeBackend.SONIC
+            else:
+                backend = UnquantizedMoeBackend.TRITON
+                logger.info_once(
+                    "Prefill Sonic / decode Triton mode requested, but Sonic "
+                    "is unavailable for this MoE config; using Triton.",
+                    scope="local",
+                )
+        elif flashinfer_trtllm_moe_enabled:
             backend = UnquantizedMoeBackend.FLASHINFER_TRTLLM
         elif flashinfer_cutlass_moe_enabled:
             backend = UnquantizedMoeBackend.FLASHINFER_CUTLASS
