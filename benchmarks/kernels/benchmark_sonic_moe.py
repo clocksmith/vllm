@@ -8,9 +8,10 @@ from functools import partial
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.sonic_moe import (
     is_sonic_moe_supported,
-    permute_weights_for_sonic,
+    prepare_weights_for_sonic,
 )
 
 SHAPES = [
@@ -80,7 +81,7 @@ def main() -> int:
         print("Sonic MoE not supported (needs SonicMoE + Hopper). Skipping.")
         return 0
 
-    # FusedMoEModularKernel allocates from v1 WorkspaceManager.
+    # FusedMoEKernel allocates from v1 WorkspaceManager.
     # When running as a standalone script (outside pytest), we must init it.
     from vllm.v1.worker.workspace import (
         init_workspace_manager,
@@ -98,10 +99,10 @@ def main() -> int:
     )
     from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
     from vllm.model_executor.layers.fused_moe.modular_kernel import (
-        FusedMoEModularKernel,
+        FusedMoEKernel,
     )
     from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-        MoEPrepareAndFinalizeNoEP,
+        MoEPrepareAndFinalizeNoDPEPModular,
     )
     from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
 
@@ -148,25 +149,24 @@ def main() -> int:
                 num_local_experts=e,
                 num_logical_experts=e,
                 moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
-                activation="silu",
+                activation=MoEActivation.SILU,
                 in_dtype=dtype,
                 device="cuda",
                 routing_method=RoutingMethodType.TopK,
             )
 
-            triton_kernel = FusedMoEModularKernel(
-                MoEPrepareAndFinalizeNoEP(),
+            triton_kernel = FusedMoEKernel(
+                MoEPrepareAndFinalizeNoDPEPModular(),
                 TritonExperts(moe_config, FUSED_MOE_UNQUANTIZED_CONFIG),
                 inplace=False,
             )
 
-            w1_sonic = permute_weights_for_sonic(w1)
-            sonic_kernel = FusedMoEModularKernel(
-                MoEPrepareAndFinalizeNoEP(),
+            w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
+            sonic_kernel = FusedMoEKernel(
+                MoEPrepareAndFinalizeNoDPEPModular(),
                 SonicMoeExperts(
                     moe_config,
                     FUSED_MOE_UNQUANTIZED_CONFIG,
-                    weights_prepermuted=True,
                 ),
                 inplace=False,
             )
@@ -183,7 +183,7 @@ def main() -> int:
                 sonic_kernel,
                 hidden_states=hidden_states,
                 w1=w1_sonic,
-                w2=w2,
+                w2=w2_sonic,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
             )

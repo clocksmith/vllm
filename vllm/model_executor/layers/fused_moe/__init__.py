@@ -29,7 +29,7 @@ from vllm.model_executor.layers.fused_moe.sonic_moe import (
     is_sonic_moe_supported,
     is_valid_sonic_moe,
     permute_weights_for_sonic,
-    sonic_moe_forward,
+    prepare_weights_for_sonic,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
@@ -74,7 +74,7 @@ __all__ = [
     "get_config",
     "is_sonic_moe_supported",
     "is_valid_sonic_moe",
-    "sonic_moe_forward",
+    "prepare_weights_for_sonic",
     "permute_weights_for_sonic",
     "SonicMoeExperts",
 ]

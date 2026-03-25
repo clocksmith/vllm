@@ -56,8 +56,6 @@ def select_unquantized_moe_backend(
     moe_config: FusedMoEConfig,
     use_ep: bool,
     use_dp: bool,
-    is_act_and_mul: bool,
-    has_bias: bool,
 ) -> UnquantizedMoeBackend:
     """
     Select the primary unquantized MoE backend
@@ -70,55 +68,24 @@ def select_unquantized_moe_backend(
     rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
 
     backend = UnquantizedMoeBackend.TRITON
-    sonic_requested = envs.VLLM_USE_SONIC_MOE
-    sonic_supported = False
-    if sonic_requested:
-        from vllm.model_executor.layers.fused_moe.sonic_moe import (
-            is_sonic_moe_supported,
-        )
-
-        sonic_supported = is_sonic_moe_supported()
-    sonic_enabled = (
-        sonic_supported
-        and sonic_requested
-        and is_act_and_mul
-        and not has_bias
-        and not use_ep
-        and not moe_config.moe_parallel_config.is_sequence_parallel
-        and moe_config.experts_per_token <= 16
-        and moe_config.in_dtype in (torch.float16, torch.bfloat16)
-        and moe_config.activation in ("silu", "silu_and_mul")
-    )
-    if sonic_requested and sonic_supported and not sonic_enabled:
-        if use_ep:
-            logger.debug_once(
-                "Sonic MoE disabled because expert parallelism is enabled."
-            )
-        elif has_bias:
-            logger.debug_once("Sonic MoE disabled because MoE biases are enabled.")
-        elif not is_act_and_mul:
-            logger.debug_once("Sonic MoE disabled because is_act_and_mul is False.")
-        elif moe_config.moe_parallel_config.is_sequence_parallel:
-            logger.debug_once(
-                "Sonic MoE disabled because sequence parallelism is enabled."
-            )
-        elif moe_config.experts_per_token > 16:
-            logger.debug_once("Sonic MoE disabled because topk > 16.")
-        elif moe_config.in_dtype not in (torch.float16, torch.bfloat16):
-            logger.debug_once(
-                "Sonic MoE disabled because input dtype is unsupported: %s",
-                moe_config.in_dtype,
-            )
-        elif moe_config.activation not in ("silu", "silu_and_mul"):
-            logger.debug_once(
-                "Sonic MoE disabled because activation is unsupported: %s",
-                moe_config.activation,
-            )
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
         if moe_config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
+    sonic_enabled = False
+    if envs.VLLM_USE_SONIC_MOE:
+        from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
+
+        sonic_enabled, reason = SonicMoeExperts.is_supported_config(
+            SonicMoeExperts,
+            moe_config,
+            None,
+            None,
+            activation_format,
+        )
+        if not sonic_enabled and reason is not None:
+            logger.debug_once("Sonic MoE disabled because %s.", reason)
 
     # Check if FlashInfer TRTLLM BF16 MoE is supported
     trtllm_supported, _ = is_supported_config_trtllm_bf16(
@@ -176,9 +143,14 @@ def select_unquantized_moe_backend(
                     scope="local",
                 )
             backend = UnquantizedMoeBackend.TRITON
-        if sonic_enabled and backend in (
-            UnquantizedMoeBackend.FLASHINFER_TRTLLM,
-            UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+        if (
+            envs.VLLM_USE_SONIC_MOE
+            and sonic_enabled
+            and backend
+            in (
+                UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+                UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+            )
         ):
             logger.info_once(
                 "VLLM_USE_SONIC_MOE=1 is set, but FlashInfer MoE is enabled and was "
@@ -215,10 +187,13 @@ def convert_to_unquantized_kernel_format(
         w13_weight = swap_w13_to_w31(layer.w13_weight.data)
     elif unquantized_backend == UnquantizedMoeBackend.SONIC:
         from vllm.model_executor.layers.fused_moe.sonic_moe import (
-            permute_weights_for_sonic,
+            prepare_weights_for_sonic,
         )
 
-        w13_weight = permute_weights_for_sonic(layer.w13_weight.data)
+        w13_weight, w2_weight = prepare_weights_for_sonic(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+        )
 
     return w13_weight, w2_weight
 
@@ -272,12 +247,11 @@ def make_unquantized_moe_kernel(
     elif backend == UnquantizedMoeBackend.SONIC:
         from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
 
-        kernel = mk.FusedMoEModularKernel(
-            MoEPrepareAndFinalizeNoEP(),
+        kernel = mk.FusedMoEKernel(
+            MoEPrepareAndFinalizeNoDPEPModular(),
             SonicMoeExperts(
                 moe_config=moe_config,
                 quant_config=quant_config,
-                weights_prepermuted=True,
             ),
             inplace=False,
         )

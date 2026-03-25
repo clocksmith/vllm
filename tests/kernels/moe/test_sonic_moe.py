@@ -5,10 +5,17 @@
 import pytest
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
     FusedMoEParallelConfig,
     RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.sonic_moe import (
     SonicMoeExperts,
@@ -17,7 +24,7 @@ from vllm.model_executor.layers.fused_moe.sonic_moe import (
     is_sonic_moe_supported,
     is_valid_sonic_moe,
     permute_weights_for_sonic,
-    sonic_moe_forward,
+    prepare_weights_for_sonic,
 )
 from vllm.platforms import current_platform
 from vllm.v1.worker.workspace import (
@@ -45,7 +52,7 @@ def make_dummy_moe_config(
     intermediate_size_per_partition: int = 1,
     in_dtype: torch.dtype = torch.bfloat16,
     device: torch.device | str = "cuda",
-    activation: str = "silu",
+    activation: MoEActivation = MoEActivation.SILU,
 ) -> FusedMoEConfig:
     return FusedMoEConfig(
         num_experts=num_experts,
@@ -154,8 +161,8 @@ def test_is_valid_sonic_moe_large_topk():
 
 
 @requires_cuda
-def test_sonic_moe_forward_unsupported():
-    """Test that sonic_moe_forward raises RuntimeError on unsupported systems."""
+def test_sonic_moe_kernel_unsupported():
+    """Test that the Sonic kernel path raises on unsupported systems."""
     if is_sonic_moe_supported():
         pytest.skip("Sonic MoE is supported on this system")
 
@@ -168,8 +175,28 @@ def test_sonic_moe_forward_unsupported():
     topk_weights = torch.randn(M, top_k, dtype=torch.float16, device="cuda")
     topk_ids = torch.randint(0, num_experts, (M, top_k), device="cuda")
 
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        experts_per_token=top_k,
+        hidden_dim=K,
+        intermediate_size_per_partition=two_n // 2,
+        in_dtype=torch.float16,
+    )
+    sonic_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
+        SonicMoeExperts(moe_config=moe_config),
+    )
+
     with pytest.raises(RuntimeError):
-        sonic_moe_forward(hidden_states, w1, w2, topk_weights, topk_ids)
+        sonic_kernel(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+        )
 
 
 def test_import_from_fused_moe():
@@ -178,12 +205,12 @@ def test_import_from_fused_moe():
         is_sonic_moe_supported,
         is_valid_sonic_moe,
         permute_weights_for_sonic,
-        sonic_moe_forward,
+        prepare_weights_for_sonic,
     )
 
     assert callable(is_sonic_moe_supported)
     assert callable(is_valid_sonic_moe)
-    assert callable(sonic_moe_forward)
+    assert callable(prepare_weights_for_sonic)
     assert callable(permute_weights_for_sonic)
     assert SonicMoeExperts is not None
 
@@ -214,14 +241,6 @@ def test_sonic_moe_vs_triton(
     dtype: torch.dtype,
 ):
     """Compare Sonic MoE against Triton reference."""
-    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-    from vllm.model_executor.layers.fused_moe.config import (
-        FUSED_MOE_UNQUANTIZED_CONFIG,
-    )
-    from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
-    from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-        MoEPrepareAndFinalizeNoEP,
-    )
     from vllm.utils.deep_gemm import calc_diff
 
     if topk > num_experts:
@@ -247,8 +266,8 @@ def test_sonic_moe_vs_triton(
         in_dtype=dtype,
     )
 
-    triton_kernel = mk.FusedMoEModularKernel(
-        MoEPrepareAndFinalizeNoEP(),
+    triton_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
         TritonExperts(
             moe_config=moe_config,
             quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -260,22 +279,22 @@ def test_sonic_moe_vs_triton(
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation="silu",
+        activation=MoEActivation.SILU,
         global_num_experts=num_experts,
     )
 
-    w1_sonic = permute_weights_for_sonic(w1)
-    sonic_kernel = mk.FusedMoEModularKernel(
-        MoEPrepareAndFinalizeNoEP(),
-        SonicMoeExperts(moe_config=moe_config, weights_prepermuted=True),
+    w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
+    sonic_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
+        SonicMoeExperts(moe_config=moe_config),
     )
     out_sonic = sonic_kernel(
         hidden_states=hidden_states,
         w1=w1_sonic,
-        w2=w2,
+        w2=w2_sonic,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation="silu",
+        activation=MoEActivation.SILU,
         global_num_experts=num_experts,
     )
 
@@ -289,14 +308,6 @@ def test_sonic_moe_vs_triton(
 )
 def test_sonic_moe_apply_router_weight_on_input():
     """Compare Sonic MoE against Triton with apply_router_weight_on_input."""
-    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-    from vllm.model_executor.layers.fused_moe.config import (
-        FUSED_MOE_UNQUANTIZED_CONFIG,
-    )
-    from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
-    from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-        MoEPrepareAndFinalizeNoEP,
-    )
     from vllm.utils.deep_gemm import calc_diff
 
     m, n, k = 128, 2048, 512
@@ -323,8 +334,8 @@ def test_sonic_moe_apply_router_weight_on_input():
     topk_ids = torch.randint(0, num_experts, (m, topk), device="cuda")
     topk_weights = torch.rand(m, topk, device="cuda", dtype=dtype) + 0.1
 
-    triton_kernel = mk.FusedMoEModularKernel(
-        MoEPrepareAndFinalizeNoEP(),
+    triton_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
         TritonExperts(
             moe_config=moe_config,
             quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -336,23 +347,23 @@ def test_sonic_moe_apply_router_weight_on_input():
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation="silu",
+        activation=MoEActivation.SILU,
         apply_router_weight_on_input=True,
         global_num_experts=num_experts,
     )
 
-    w1_sonic = permute_weights_for_sonic(w1)
-    sonic_kernel = mk.FusedMoEModularKernel(
-        MoEPrepareAndFinalizeNoEP(),
-        SonicMoeExperts(moe_config=moe_config, weights_prepermuted=True),
+    w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
+    sonic_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
+        SonicMoeExperts(moe_config=moe_config),
     )
     out_sonic = sonic_kernel(
         hidden_states=hidden_states,
         w1=w1_sonic,
-        w2=w2,
+        w2=w2_sonic,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation="silu",
+        activation=MoEActivation.SILU,
         apply_router_weight_on_input=True,
         global_num_experts=num_experts,
     )

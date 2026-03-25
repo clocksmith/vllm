@@ -19,15 +19,12 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
-    RoutingMethodType,
-)
-from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    MoEPrepareAndFinalizeNoEP,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -38,6 +35,7 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _sonicmoe_available: bool | None = None
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def _check_sonicmoe_available() -> bool:
@@ -176,7 +174,20 @@ def permute_weights_for_sonic(w: torch.Tensor) -> torch.Tensor:
     return w_interleaved.reshape(E, two_N, K).contiguous()
 
 
-class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
+def prepare_weights_for_sonic(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    weights_prepermuted: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    w1_interleaved = w1 if weights_prepermuted else permute_weights_for_sonic(w1)
+    return (
+        w1_interleaved.permute(1, 2, 0),
+        w2.contiguous().permute(1, 2, 0),
+    )
+
+
+class SonicMoeExperts(mk.FusedMoEExpertsModular):
     """
     Sonic MoE experts implementation for Hopper GPUs.
 
@@ -188,15 +199,9 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig = FUSED_MOE_UNQUANTIZED_CONFIG,
-        weights_prepermuted: bool = False,
     ):
         super().__init__(moe_config, quant_config)
         self.out_dtype = moe_config.in_dtype
-        self.weights_prepermuted = weights_prepermuted
-        self._w1_sonic: torch.Tensor | None = None
-        self._w2_sonic: torch.Tensor | None = None
-        self._w1_id: int = -1
-        self._w2_id: int = -1
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -218,8 +223,33 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         return (weight_key, activation_key) == (None, None)
 
     @staticmethod
-    def _supports_activation(activation: str) -> bool:
-        return activation in ("silu", "silu_and_mul")
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = mk.FusedMoEExperts.is_supported_config(
+            cls,
+            moe_config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+        if not supported:
+            return supported, reason
+        if moe_config.has_bias:
+            return False, "MoE biases are enabled"
+        if moe_config.experts_per_token > 16:
+            return False, "topk > 16"
+        if moe_config.in_dtype not in _SUPPORTED_DTYPES:
+            return False, f"input dtype is unsupported: {moe_config.in_dtype}"
+        return True, None
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SILU
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -234,6 +264,27 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
     def supports_chunking(self) -> bool:
         return True
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        assert w1.dim() == 3 and w2.dim() == 3
+        two_n, _, num_experts = w1.size()
+        k = a1.size(-1)
+
+        if a1.dim() == 2:
+            assert topk_ids.size(0) == a1.size(0), f"{topk_ids.size(0)} != {a1.size(0)}"
+            m = a1.size(0)
+        else:
+            raise AssertionError(f"Unexpected activation rank {a1.dim()}")
+
+        assert topk_ids.dim() == 2
+        topk = topk_ids.size(1)
+        return num_experts, m, two_n, k, topk
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -246,7 +297,7 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: str,
+        activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace1 = (M * topk, max(N, K))
@@ -262,30 +313,6 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         output = (M, K)
         return (workspace1, workspace2, output)
 
-    def _ensure_weights_ready(
-        self, w1: torch.Tensor, w2: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._w1_id != id(w1) or self._w2_id != id(w2):
-            w1_interleaved = (
-                w1 if self.weights_prepermuted else permute_weights_for_sonic(w1)
-            )
-            # SonicMoE expects:
-            # w1: (I, H, E) with stride(H) == 1 and stride_order (2, 0, 1)
-            # w2: (H, I, E) with stride(I) == 1 and stride_order (2, 0, 1)
-            #
-            # vLLM provides:
-            # w1: (E, 2I, H) in silu_and_mul format (after swiglu interleave)
-            # w2: (E, H, I)
-            #
-            # A pure permute produces the stride pattern SonicMoE validates via
-            # mark_layout_dynamic(leading_dim=1) + mark_compact_shape_dynamic(...).
-            self._w1_sonic = w1_interleaved.permute(1, 2, 0)
-            self._w2_sonic = w2.contiguous().permute(1, 2, 0)
-            self._w1_id = id(w1)
-            self._w2_id = id(w2)
-        assert self._w1_sonic is not None and self._w2_sonic is not None
-        return self._w1_sonic, self._w2_sonic
-
     def apply(
         self,
         output: torch.Tensor,
@@ -294,7 +321,7 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str,
+        activation: MoEActivation,
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
@@ -315,13 +342,10 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         """
         if expert_map is not None:
             raise ValueError("Sonic MoE does not support expert_map/EP.")
-        if activation not in ("silu", "silu_and_mul"):
+        if activation != MoEActivation.SILU:
             raise ValueError(
-                f"Sonic MoE only supports silu/silu_and_mul activation, "
-                f"got {activation}"
+                f"Sonic MoE only supports SILU activation, got {activation.value}"
             )
-
-        w1_sonic, w2_sonic = self._ensure_weights_ready(w1, w2)
 
         try:
             from sonicmoe.functional.forward import (
@@ -341,21 +365,17 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
             ) from e
 
         M, K = hidden_states.shape
-        two_n, k_from_w1, num_experts = w1_sonic.shape
+        two_n, k_from_w1, num_experts = w1.shape
         topk = topk_ids.shape[1]
         if k_from_w1 != K:
             raise ValueError(f"Sonic MoE expects w1 last dim {K}, got {k_from_w1}")
         if two_n % 2 != 0:
             raise ValueError(f"Sonic MoE expects w1 second dim to be even, got {two_n}")
         n = two_n // 2
-        if (
-            w2_sonic.size(0) != K
-            or w2_sonic.size(1) != n
-            or w2_sonic.size(2) != num_experts
-        ):
+        if w2.size(0) != K or w2.size(1) != n or w2.size(2) != num_experts:
             raise ValueError(
                 "Sonic MoE expects w2 shape (K, N, E) with "
-                f"K={K}, N={n}, E={num_experts}, got {tuple(w2_sonic.shape)}"
+                f"K={K}, N={n}, E={num_experts}, got {tuple(w2.shape)}"
             )
 
         # TODO(https://github.com/vllm-project/vllm/issues/31578): use router logits
@@ -398,7 +418,7 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
         try:
             _up_projection_forward(
                 x=hidden_states,
-                w1=w1_sonic,
+                w1=w1,
                 z=z,
                 y1=y1,
                 b1=None,
@@ -420,15 +440,15 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 f"Original error: {type(e).__name__}: {e}\n"
                 f"x: shape={tuple(hidden_states.shape)} "
                 f"stride={hidden_states.stride()} dtype={hidden_states.dtype}\n"
-                f"w1: shape={tuple(w1_sonic.shape)} "
-                f"stride={w1_sonic.stride()} dtype={w1_sonic.dtype}\n"
+                f"w1: shape={tuple(w1.shape)} "
+                f"stride={w1.stride()} dtype={w1.dtype}\n"
                 f"z: shape={tuple(z.shape)} stride={z.stride()} dtype={z.dtype}\n"
                 f"y1: shape={tuple(y1.shape)} stride={y1.stride()} dtype={y1.dtype}\n"
             ) from None
 
         try:
             _down_projection_forward(
-                w2=w2_sonic,
+                w2=w2,
                 y1=y1,
                 y2=y2,
                 b2=None,
@@ -441,14 +461,14 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
             raise RuntimeError(
                 "SonicMoE down-projection failed.\n"
                 f"Original error: {type(e).__name__}: {e}\n"
-                f"w2: shape={tuple(w2_sonic.shape)} "
-                f"stride={w2_sonic.stride()} dtype={w2_sonic.dtype}\n"
+                f"w2: shape={tuple(w2.shape)} "
+                f"stride={w2.stride()} dtype={w2.dtype}\n"
                 f"y1: shape={tuple(y1.shape)} stride={y1.stride()} dtype={y1.dtype}\n"
                 f"y2: shape={tuple(y2.shape)} stride={y2.stride()} dtype={y2.dtype}\n"
             ) from None
 
         # apply_router_weight_on_input only supported for topk=1
-        # (consistent with MoEPrepareAndFinalizeNoEP)
+        # (consistent with MoEPrepareAndFinalizeNoDPEPModular)
         if apply_router_weight_on_input:
             if topk != 1:
                 raise ValueError(
@@ -481,57 +501,3 @@ class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 f"o: shape={tuple(output.shape)} "
                 f"stride={output.stride()} dtype={output.dtype}\n"
             ) from None
-
-
-def sonic_moe_forward(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str = "silu",
-    global_num_experts: int = -1,
-    expert_map: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Sonic MoE forward pass using modular kernel infrastructure.
-    """
-    if not is_sonic_moe_supported():
-        raise RuntimeError(
-            "Sonic MoE is not supported on this system. "
-            "Requires: SonicMoE + Hopper GPU (H100/H200)"
-        )
-
-    dtype = hidden_states.dtype
-    num_experts = w1.size(0)
-    moe_config = FusedMoEConfig(
-        num_experts=num_experts,
-        experts_per_token=topk_ids.size(1),
-        hidden_dim=hidden_states.size(1),
-        intermediate_size_per_partition=w1.size(1) // 2,
-        num_local_experts=num_experts,
-        num_logical_experts=(
-            global_num_experts if global_num_experts > 0 else num_experts
-        ),
-        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
-        activation=activation,
-        in_dtype=dtype,
-        device=hidden_states.device,
-        routing_method=RoutingMethodType.TopK,
-        is_act_and_mul=True,
-    )
-    fused_experts = mk.FusedMoEModularKernel(
-        MoEPrepareAndFinalizeNoEP(),
-        SonicMoeExperts(moe_config=moe_config),
-    )
-
-    return fused_experts(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        activation=activation,
-        global_num_experts=global_num_experts,
-        expert_map=expert_map,
-    )
