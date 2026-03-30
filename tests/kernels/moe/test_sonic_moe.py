@@ -188,7 +188,7 @@ def test_sonic_moe_kernel_unsupported():
     )
 
     with pytest.raises(RuntimeError):
-        sonic_kernel(
+        sonic_kernel.apply(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -196,6 +196,8 @@ def test_sonic_moe_kernel_unsupported():
             topk_ids=topk_ids,
             activation=MoEActivation.SILU,
             global_num_experts=num_experts,
+            expert_map=None,
+            apply_router_weight_on_input=False,
         )
 
 
