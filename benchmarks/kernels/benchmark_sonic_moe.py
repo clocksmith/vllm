@@ -49,7 +49,7 @@ def _bench_us(fn, warmup: int, iters: int, graph_calls: int) -> tuple[float, str
 
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -191,7 +191,7 @@ def main() -> int:
             with torch.inference_mode():
                 out_triton = run_triton()
                 out_sonic = run_sonic()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
 
                 denom = out_triton.abs().max().clamp_min(1e-6)
                 rel_err = ((out_sonic - out_triton).abs().max() / denom).item()
