@@ -36,7 +36,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
-    UnquantizedMoeBackend,
     select_unquantized_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
@@ -52,7 +51,6 @@ from vllm.v1.worker.workspace import (
     init_workspace_manager,
     is_workspace_manager_initialized,
 )
-
 
 DEFAULT_PREFILL_M = [256, 512, 1024]
 DEFAULT_DECODE_M = [1, 2, 4, 8, 16, 32, 64]
@@ -125,7 +123,6 @@ def _make_moe_config(
         hidden_dim=k,
         intermediate_size_per_partition=n // 2,
         num_local_experts=e,
-        num_logical_experts=e,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         activation="silu",
         in_dtype=dtype,
@@ -404,7 +401,7 @@ def main() -> int:
             print(
                 f"[ok] phase={phase} dtype={row['dtype']} m={m} k={k} n={n} "
                 f"e={e} topk={topk} triton={row['triton_us']:.2f}us "
-                f"sonic={'%.2f' % row['sonic_us'] if row['sonic_us'] else 'n/a'} "
+                f"sonic={format(row['sonic_us'], '.2f') if row['sonic_us'] else 'n/a'} "
                 f"best={row['best_strategy']}"
             )
         except RuntimeError as exc:

@@ -162,9 +162,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_USE_SONIC_MOE: bool = False
-    VLLM_SONIC_MOE_PD_BACKEND_MODE: Literal[
-        "off", "prefill_sonic_decode_triton"
-    ] = "off"
+    VLLM_SONIC_MOE_PD_BACKEND_MODE: Literal["off", "prefill_sonic_decode_triton"] = (
+        "off"
+    )
     VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput", "latency", "masked_gemm"] = (
         "latency"
     )

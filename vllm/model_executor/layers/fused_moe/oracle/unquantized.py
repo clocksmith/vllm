@@ -77,10 +77,7 @@ def select_unquantized_moe_backend(
         sonic_pd_mode == "prefill_sonic_decode_triton"
         and moe_config.kv_role == "kv_consumer"
     )
-    if (
-        sonic_pd_mode == "prefill_sonic_decode_triton"
-        and moe_config.kv_role is None
-    ):
+    if sonic_pd_mode == "prefill_sonic_decode_triton" and moe_config.kv_role is None:
         logger.info_once(
             "VLLM_SONIC_MOE_PD_BACKEND_MODE=prefill_sonic_decode_triton "
             "is set, but kv_role is unavailable; using default backend "
