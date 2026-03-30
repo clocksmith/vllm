@@ -247,8 +247,8 @@ def make_unquantized_moe_kernel(
     elif backend == UnquantizedMoeBackend.SONIC:
         from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
 
-        kernel = mk.FusedMoEKernel(
-            MoEPrepareAndFinalizeNoDPEPModular(),
+        kernel = mk.FusedMoEModularKernel(
+            MoEPrepareAndFinalizeNoEP(),
             SonicMoeExperts(
                 moe_config=moe_config,
                 quant_config=quant_config,

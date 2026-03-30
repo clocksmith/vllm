@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -15,7 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    MoEPrepareAndFinalizeNoDPEPModular,
+    MoEPrepareAndFinalizeNoEP,
 )
 from vllm.model_executor.layers.fused_moe.sonic_moe import (
     SonicMoeExperts,
@@ -52,7 +51,7 @@ def make_dummy_moe_config(
     intermediate_size_per_partition: int = 1,
     in_dtype: torch.dtype = torch.bfloat16,
     device: torch.device | str = "cuda",
-    activation: MoEActivation = MoEActivation.SILU,
+    activation: str = "silu",
 ) -> FusedMoEConfig:
     return FusedMoEConfig(
         num_experts=num_experts,
@@ -60,7 +59,6 @@ def make_dummy_moe_config(
         hidden_dim=hidden_dim,
         intermediate_size_per_partition=intermediate_size_per_partition,
         num_local_experts=num_experts,
-        num_logical_experts=num_experts,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         activation=activation,
         in_dtype=in_dtype,
@@ -182,22 +180,20 @@ def test_sonic_moe_kernel_unsupported():
         intermediate_size_per_partition=two_n // 2,
         in_dtype=torch.float16,
     )
-    sonic_kernel = mk.FusedMoEKernel(
-        MoEPrepareAndFinalizeNoDPEPModular(),
+    sonic_kernel = mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
         SonicMoeExperts(moe_config=moe_config),
     )
 
     with pytest.raises(RuntimeError):
-        sonic_kernel.apply(
+        sonic_kernel(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            activation=MoEActivation.SILU,
+            activation="silu",
             global_num_experts=num_experts,
-            expert_map=None,
-            apply_router_weight_on_input=False,
         )
 
 
@@ -268,8 +264,8 @@ def test_sonic_moe_vs_triton(
         in_dtype=dtype,
     )
 
-    triton_kernel = mk.FusedMoEKernel(
-        MoEPrepareAndFinalizeNoDPEPModular(),
+    triton_kernel = mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
         TritonExperts(
             moe_config=moe_config,
             quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -281,13 +277,13 @@ def test_sonic_moe_vs_triton(
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation="silu",
         global_num_experts=num_experts,
     )
 
     w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
-    sonic_kernel = mk.FusedMoEKernel(
-        MoEPrepareAndFinalizeNoDPEPModular(),
+    sonic_kernel = mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
         SonicMoeExperts(moe_config=moe_config),
     )
     out_sonic = sonic_kernel(
@@ -296,7 +292,7 @@ def test_sonic_moe_vs_triton(
         w2=w2_sonic,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation="silu",
         global_num_experts=num_experts,
     )
 
@@ -336,8 +332,8 @@ def test_sonic_moe_apply_router_weight_on_input():
     topk_ids = torch.randint(0, num_experts, (m, topk), device="cuda")
     topk_weights = torch.rand(m, topk, device="cuda", dtype=dtype) + 0.1
 
-    triton_kernel = mk.FusedMoEKernel(
-        MoEPrepareAndFinalizeNoDPEPModular(),
+    triton_kernel = mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
         TritonExperts(
             moe_config=moe_config,
             quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -349,14 +345,14 @@ def test_sonic_moe_apply_router_weight_on_input():
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation="silu",
         apply_router_weight_on_input=True,
         global_num_experts=num_experts,
     )
 
     w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
-    sonic_kernel = mk.FusedMoEKernel(
-        MoEPrepareAndFinalizeNoDPEPModular(),
+    sonic_kernel = mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
         SonicMoeExperts(moe_config=moe_config),
     )
     out_sonic = sonic_kernel(
@@ -365,7 +361,7 @@ def test_sonic_moe_apply_router_weight_on_input():
         w2=w2_sonic,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation="silu",
         apply_router_weight_on_input=True,
         global_num_experts=num_experts,
     )

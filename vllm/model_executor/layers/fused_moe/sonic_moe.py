@@ -19,7 +19,6 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -187,7 +186,7 @@ def prepare_weights_for_sonic(
     )
 
 
-class SonicMoeExperts(mk.FusedMoEExpertsModular):
+class SonicMoeExperts(mk.FusedMoEPermuteExpertsUnpermute):
     """
     Sonic MoE experts implementation for Hopper GPUs.
 
@@ -224,13 +223,13 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def is_supported_config(
-        cls: type[mk.FusedMoEExperts],
+        cls: type[mk.FusedMoEPermuteExpertsUnpermute],
         moe_config: FusedMoEConfig,
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
-        supported, reason = mk.FusedMoEExperts.is_supported_config(
+        supported, reason = mk.FusedMoEPermuteExpertsUnpermute.is_supported_config(
             cls,
             moe_config,
             weight_key,
@@ -248,8 +247,8 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
         return True, None
 
     @staticmethod
-    def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+    def _supports_activation(activation: str) -> bool:
+        return activation == "silu"
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -297,7 +296,7 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: MoEActivation,
+        activation: str,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace1 = (M * topk, max(N, K))
@@ -321,7 +320,7 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: MoEActivation,
+        activation: str,
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
@@ -342,9 +341,9 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
         """
         if expert_map is not None:
             raise ValueError("Sonic MoE does not support expert_map/EP.")
-        if activation != MoEActivation.SILU:
+        if activation != "silu":
             raise ValueError(
-                f"Sonic MoE only supports SILU activation, got {activation.value}"
+                f"Sonic MoE only supports SILU activation, got {activation}"
             )
 
         try:
@@ -468,7 +467,7 @@ class SonicMoeExperts(mk.FusedMoEExpertsModular):
             ) from None
 
         # apply_router_weight_on_input only supported for topk=1
-        # (consistent with MoEPrepareAndFinalizeNoDPEPModular)
+        # (consistent with MoEPrepareAndFinalizeNoEP)
         if apply_router_weight_on_input:
             if topk != 1:
                 raise ValueError(

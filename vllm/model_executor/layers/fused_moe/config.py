@@ -1071,10 +1071,7 @@ class FusedMoEConfig:
     hidden_dim: int
     intermediate_size_per_partition: int
     num_local_experts: int
-    # Logical number of experts (may differ from num_experts when using
-    # fused/shared experts or other expert remapping schemes).
-    num_logical_experts: int
-    activation: MoEActivation
+    activation: str
     device: torch.device | str
     routing_method: RoutingMethodType
     moe_parallel_config: FusedMoEParallelConfig

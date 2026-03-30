@@ -8,7 +8,6 @@ from functools import partial
 
 import torch
 
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.sonic_moe import (
     is_sonic_moe_supported,
     prepare_weights_for_sonic,
@@ -81,7 +80,7 @@ def main() -> int:
         print("Sonic MoE not supported (needs SonicMoE + Hopper). Skipping.")
         return 0
 
-    # FusedMoEKernel allocates from v1 WorkspaceManager.
+    # FusedMoEModularKernel allocates from v1 WorkspaceManager.
     # When running as a standalone script (outside pytest), we must init it.
     from vllm.v1.worker.workspace import (
         init_workspace_manager,
@@ -99,10 +98,10 @@ def main() -> int:
     )
     from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
     from vllm.model_executor.layers.fused_moe.modular_kernel import (
-        FusedMoEKernel,
+        FusedMoEModularKernel,
     )
     from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-        MoEPrepareAndFinalizeNoDPEPModular,
+        MoEPrepareAndFinalizeNoEP,
     )
     from vllm.model_executor.layers.fused_moe.sonic_moe import SonicMoeExperts
 
@@ -147,23 +146,22 @@ def main() -> int:
                 hidden_dim=k,
                 intermediate_size_per_partition=n // 2,
                 num_local_experts=e,
-                num_logical_experts=e,
                 moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
-                activation=MoEActivation.SILU,
+                activation="silu",
                 in_dtype=dtype,
                 device="cuda",
                 routing_method=RoutingMethodType.TopK,
             )
 
-            triton_kernel = FusedMoEKernel(
-                MoEPrepareAndFinalizeNoDPEPModular(),
+            triton_kernel = FusedMoEModularKernel(
+                MoEPrepareAndFinalizeNoEP(),
                 TritonExperts(moe_config, FUSED_MOE_UNQUANTIZED_CONFIG),
                 inplace=False,
             )
 
             w1_sonic, w2_sonic = prepare_weights_for_sonic(w1, w2)
-            sonic_kernel = FusedMoEKernel(
-                MoEPrepareAndFinalizeNoDPEPModular(),
+            sonic_kernel = FusedMoEModularKernel(
+                MoEPrepareAndFinalizeNoEP(),
                 SonicMoeExperts(
                     moe_config,
                     FUSED_MOE_UNQUANTIZED_CONFIG,
